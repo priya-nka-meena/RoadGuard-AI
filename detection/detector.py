@@ -29,6 +29,10 @@ class PotholeDetector:
 
         detections = []
 
+        # Handle case where no detections are found
+        if results[0].boxes is None:
+            return detections
+
         for box in results[0].boxes:
             class_id = int(box.cls[0].item())
 
