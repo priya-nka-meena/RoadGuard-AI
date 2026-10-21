@@ -39,23 +39,30 @@ def _safe_remove(path):
 
 # ---------------------------------------------------------------- drawing
 def draw_boxes(image_bgr, detections):
-    """Draw severity-coloured boxes on a BGR image. Returns an RGB array."""
+    """Draw severity-coloured, numbered boxes on a BGR image. Returns RGB."""
     img = image_bgr.copy()
     h, w = img.shape[:2]
-    thickness = max(2, round(max(h, w) / 400))
-    scale = max(0.5, max(h, w) / 1200)
-    for d in detections:
+    thickness = max(1, round(max(h, w) / 350))
+    scale = max(0.4, max(h, w) / 1000)
+    for n, d in enumerate(detections, start=1):
         x1, y1, x2, y2 = [int(v) for v in d["bbox"]]
         r, g, b = SEVERITY_RGB.get(d["severity"], (37, 99, 235))
         color = (b, g, r)  # OpenCV uses BGR
         cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
-        text = f'{d["label"]} {d["confidence"] * 100:.0f}% {d["severity"]}'
+        text = f'#{d.get("id", n)} {d["confidence"] * 100:.0f}%'
         (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
-        top = max(0, y1 - th - base - 4)
-        cv2.rectangle(img, (x1, top), (x1 + tw + 6, top + th + base + 4), color, -1)
-        cv2.putText(img, text, (x1 + 3, top + th + 1), cv2.FONT_HERSHEY_SIMPLEX,
+        box_w, box_h = tw + 8, th + base + 4
+        tx = min(max(0, x1), max(0, w - box_w))          # keep label inside image
+        ty = y1 - box_h if y1 - box_h >= 0 else y1       # above box, else inside top
+        cv2.rectangle(img, (tx, ty), (tx + box_w, ty + box_h), color, -1)
+        cv2.putText(img, text, (tx + 4, ty + th + 1), cv2.FONT_HERSHEY_SIMPLEX,
                     scale, (255, 255, 255), 1, cv2.LINE_AA)
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def png_bytes(rgb):
+    ok, buf = cv2.imencode(".png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    return buf.tobytes() if ok else b""
 
 
 def decode_image(file_bytes):
@@ -66,13 +73,16 @@ def decode_image(file_bytes):
 
 
 # ----------------------------------------------------------------- images
-def run_image_analysis(file_bytes, filename):
+def run_image_analysis(file_bytes, filename, confidence=0.25):
     path = _write_temp(file_bytes, filename)
     try:
-        result = analyze_image(path)
+        result = analyze_image(path, confidence=confidence)
     finally:
         _safe_remove(path)
     result["image"] = filename
+    result["detections"].sort(key=lambda d: d["confidence"], reverse=True)
+    for n, d in enumerate(result["detections"], start=1):
+        d["id"] = n
     annotated = draw_boxes(decode_image(file_bytes), result["detections"])
     return result, annotated
 
@@ -125,10 +135,10 @@ def _best_frames(video_path, result, n=3):
     return previews
 
 
-def run_video_analysis(file_bytes, filename, frame_stride=5, gps_csv_bytes=None):
+def run_video_analysis(file_bytes, filename, frame_stride=5, gps_csv_bytes=None, confidence=0.25):
     path = _write_temp(file_bytes, filename)
     try:
-        result = analyze_video(path, frame_stride=frame_stride)
+        result = analyze_video(path, frame_stride=frame_stride, confidence=confidence)
         gps_matched = attach_gps_from_csv(result, gps_csv_bytes) if gps_csv_bytes else 0
         previews = _best_frames(path, result)
     finally:
@@ -160,17 +170,19 @@ def video_rows(result):
 def display_table(rows):
     """Human-friendly DataFrame for showing in the UI."""
     data = []
-    for r in rows:
+    for n, r in enumerate(rows, start=1):
         has_gps = r.get("latitude") is not None and r.get("longitude") is not None
         row = {
+            "#": n,
             "Label": r["label"],
             "Confidence %": round(r["confidence"] * 100, 1),
             "Severity": r["severity"],
-            "Latitude": round(r["latitude"], 6) if has_gps else NO_GPS,
-            "Longitude": round(r["longitude"], 6) if has_gps else NO_GPS,
+            "Latitude": f'{r["latitude"]:.6f}' if has_gps else NO_GPS,
+            "Longitude": f'{r["longitude"]:.6f}' if has_gps else NO_GPS,
         }
         if r.get("timestamp_seconds") is not None:
             row = {"Time (s)": r["timestamp_seconds"], "Frame": r["frame_index"], **row}
+            row.pop("#", None)
         data.append(row)
     return pd.DataFrame(data)
 
@@ -181,3 +193,10 @@ def severity_counts(rows):
         if r["severity"] in counts:
             counts[r["severity"]] += 1
     return counts
+
+
+def priority_level(counts):
+    for level in ("HIGH", "MEDIUM", "LOW"):
+        if counts[level]:
+            return level
+    return "NONE"

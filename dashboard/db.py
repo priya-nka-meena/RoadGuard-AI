@@ -60,3 +60,17 @@ def load_history():
 def clear_history():
     with _connect() as conn:
         conn.execute("DELETE FROM detections")
+
+
+
+def delete_source(source_name):
+    with _connect() as conn:
+        conn.execute("DELETE FROM detections WHERE source_name = ?", (source_name,))
+
+
+def storage_info():
+    """(path, size in KB, row count) of the local history database."""
+    with _connect() as conn:
+        rows = conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
+    size_kb = DB_PATH.stat().st_size / 1024 if DB_PATH.exists() else 0
+    return DB_PATH, size_kb, rows
