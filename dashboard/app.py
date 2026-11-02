@@ -5,6 +5,7 @@
 import io
 import json
 import sys
+import time
 import wave
 from pathlib import Path
 
@@ -18,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dashboard import db, services  # noqa: E402
+from dashboard import db, live, services  # noqa: E402
 
 st.set_page_config(page_title="RoadGuard AI", page_icon="🛣️", layout="wide")
 db.init_db()
@@ -64,9 +65,25 @@ button[data-baseweb="tab"] {font-weight: 600;}
 
 hero_slot = st.empty()
 
+
+def render_hero():
+    latest = db.load_history()
+    n_total = len(latest)
+    n_high = int((latest["severity"] == "HIGH").sum()) if n_total else 0
+    n_gps = int(latest["latitude"].notna().sum()) if n_total else 0
+    hero_slot.markdown(
+        '<div class="rg-hero"><h1>🛣️ RoadGuard AI</h1>'
+        "<p>Pothole detection, visual severity assessment and location mapping</p>"
+        f'<span class="rg-chip">{n_total} detections</span>'
+        f'<span class="rg-chip">{n_high} HIGH</span>'
+        f'<span class="rg-chip">{n_gps} with GPS</span></div>', unsafe_allow_html=True)
+
+
+render_hero()
+
 PAGES = {
     "📊 Overview": ("Overview", "Summary of everything detected and saved so far."),
-    "🔍 Detect": ("Detect", "Upload road images or a video and run the AI detector."),
+    "🔍 Detect": ("Detect", "Upload road images or a video, or use the live camera."),
     "🗂️ History": ("History", "Every saved detection. Filter, update repair status, export or delete."),
     "🗺️ Map": ("Map", "Detections with real GPS. Hover or click a dot for details."),
     "🚨 Alerts": ("Alerts", "HIGH-severity hazards that are not fixed yet."),
@@ -318,6 +335,124 @@ def video_tab():
         show_video_result(res, play)
 
 
+# -------------------------------------------------------------------- Live
+def run_live_loop(source, every_n):
+    """Read frames, detect, draw and show them until Stop is pressed."""
+    frame_box, alert_box, stats_box, sound_box = st.empty(), st.empty(), st.empty(), st.empty()
+    cap = live.open_camera(source)
+    if cap is None:
+        st.session_state["live_running"] = False
+        st.error("Could not open the camera. Close other programs using it (for example "
+                 "detect_live.py), check the source, and try again.")
+        return
+    detector = live.get_detector(conf)
+    st.session_state["live_best"] = None
+    st.session_state["live_stats"] = None
+    st.session_state["live_saved"] = False
+    n = frames_with = 0
+    detections, best_score, last_beep, start = [], (0, 0.0), 0.0, time.time()
+    try:
+        while st.session_state.get("live_running"):
+            ok, frame = cap.read()
+            if not ok:
+                break  # camera disconnected or video file ended
+            n += 1
+            h, w = frame.shape[:2]
+            if n % every_n == 1 or every_n == 1:
+                detections = live.add_severity(detector.detect(frame), w, h)
+            frames_with += 1 if detections else 0
+            rgb = services.draw_boxes(frame, detections)
+            frame_box.image(rgb, channels="RGB", width="stretch")
+            st.session_state["live_last"] = {"rgb": rgb, "detections": detections}
+            st.session_state["live_stats"] = {"frames": n, "frames_with": frames_with,
+                                              "seconds": time.time() - start}
+            score = live.frame_score(detections)
+            if detections and score > best_score:
+                best_score = score
+                st.session_state["live_best"] = {"rgb": rgb, "detections": detections,
+                                                 "time": time.strftime("%Y%m%d_%H%M%S")}
+            has_high = any(d["severity"] == "HIGH" for d in detections)
+            if has_high:
+                alert_box.error("🚨 HIGH-severity pothole in view")
+                if sound_on and time.time() - last_beep > 5:
+                    last_beep = time.time()
+                    sound_box.audio(beep_wav(), format="audio/wav", autoplay=True)
+            else:
+                alert_box.empty()
+            if n % 8 == 0:
+                with stats_box.container():
+                    m = st.columns(4)
+                    m[0].metric("Frames shown", n)
+                    m[1].metric("Frames with potholes", frames_with)
+                    m[2].metric("Potholes in view", len(detections))
+                    m[3].metric("Speed (fps)", f"{n / max(time.time() - start, 0.001):.1f}")
+    finally:
+        cap.release()
+    st.session_state["live_running"] = False  # reached only if the camera ended by itself
+    st.rerun()
+
+
+def live_review():
+    """After stopping: show the strongest detection of the session and offer to save it."""
+    item = st.session_state.get("live_best") or st.session_state.get("live_last")
+    if not item:
+        return
+    dets = item["detections"]
+    stats = st.session_state.get("live_stats")
+    rows = services.detections_to_rows(dets)
+    counts = services.severity_counts(rows)
+    st.markdown("---")
+    st.subheader("Strongest detection of this session" if dets else "Last frame (no potholes found)")
+    img_col, info_col = st.columns([3, 2])
+    img_col.image(item["rgb"], width="stretch")
+    with info_col:
+        if stats and stats["frames"]:
+            a, b = st.columns(2)
+            a.metric("Session length", f"{stats['seconds']:.0f} s")
+            b.metric("Frames shown", stats["frames"])
+            c, d = st.columns(2)
+            c.metric("Frames with potholes", stats["frames_with"])
+            d.metric("Share of frames", f"{100 * stats['frames_with'] / stats['frames']:.0f}%")
+        priority_banner(counts)
+    severity_cards(counts, "Potholes in this frame")
+    if dets:
+        styled_table(services.display_table(rows))
+    st.markdown(
+        '<div class="rg-gps">📍 <b>Location unavailable</b> '
+        "(a webcam has no GPS, so no location is recorded for live frames)</div>",
+        unsafe_allow_html=True)
+    saved = st.session_state.get("live_saved", False)
+    label = "✅ Saved to history" if saved else "💾 Save snapshot to history"
+    if st.button(label, type="primary", disabled=(not dets) or saved, key="live_save"):
+        name = f"live_{item.get('time', time.strftime('%Y%m%d_%H%M%S'))}"
+        db.save_detections("live", name, rows)
+        st.session_state["live_saved"] = True
+        st.rerun()
+    if saved:
+        st.success("Saved to History (type: live). It has no location, so it will not appear on the Map.")
+
+
+def live_tab():
+    st.caption("Runs Member 1's detector on a live camera. A webcam has no GPS, so location "
+               "stays unavailable. Only one program can use the webcam at a time.")
+    c1, c2 = st.columns([2, 1])
+    source = c1.text_input("Camera source", "0", key="live_source",
+                           help="0 = laptop webcam. A phone used as a network camera gives a stream "
+                                "URL you can paste here. A video file path also works for testing.")
+    every_n = c2.slider("Detect every Nth frame", 1, 5, 2, key="live_every",
+                        help="Higher = smoother video on slow laptops, but detection updates less often.")
+    running = st.session_state.get("live_running", False)
+    b1, b2, _ = st.columns([1, 1, 4])
+    b1.button("▶ Start camera", type="primary", disabled=running,
+              on_click=lambda: st.session_state.update(live_running=True))
+    b2.button("⏹ Stop", disabled=not running,
+              on_click=lambda: st.session_state.update(live_running=False))
+    if running:
+        run_live_loop(live.parse_source(source), every_n)
+    else:
+        live_review()
+
+
 # -------------------------------------------------------------------- pages
 def history_view(df, keep_id=False):
     out = df.copy()
@@ -390,7 +525,8 @@ def page_history(df):
     else:
         f1, f2, f3 = st.columns(3)
         sev = f1.multiselect("Severity", SEV_ORDER, default=SEV_ORDER)
-        typ = f2.multiselect("Source type", ["image", "video"], default=["image", "video"])
+        typ = f2.multiselect("Source type", ["image", "video", "live"],
+                             default=["image", "video", "live"])
         sts = f3.multiselect("Repair status", db.STATUSES, default=db.STATUSES)
         view = df[df["severity"].isin(sev) & df["source_type"].isin(typ) & df["status"].isin(sts)]
         st.caption(f"{len(view)} of {len(df)} records. Change the **Status** column, then save.")
@@ -497,16 +633,20 @@ def page_alerts(df):
         st.audio(beep_wav(), format="audio/wav", autoplay=True)
 
 
+if not choice.endswith("Detect"):
+    st.session_state["live_running"] = False  # never keep the camera on in the background
 history = db.load_history()
 page_header(choice)
 if choice.endswith("Overview"):
     page_overview(history)
 elif choice.endswith("Detect"):
-    tab_i, tab_v = st.tabs(["🖼️ Images", "🎞️ Video"])
+    tab_i, tab_v, tab_l = st.tabs(["🖼️ Images", "🎞️ Video", "📷 Live camera"])
     with tab_i:
         image_tab()
     with tab_v:
         video_tab()
+    with tab_l:
+        live_tab()
 elif choice.endswith("History"):
     page_history(history)
 elif choice.endswith("Map"):
@@ -514,14 +654,5 @@ elif choice.endswith("Map"):
 else:
     page_alerts(history)
 
-# Hero is filled last so its numbers include anything saved during this run.
-latest = db.load_history()
-n_total = len(latest)
-n_high = int((latest["severity"] == "HIGH").sum()) if n_total else 0
-n_gps = int(latest["latitude"].notna().sum()) if n_total else 0
-hero_slot.markdown(
-    '<div class="rg-hero"><h1>🛣️ RoadGuard AI</h1>'
-    "<p>Pothole detection, visual severity assessment and location mapping</p>"
-    f'<span class="rg-chip">{n_total} detections</span>'
-    f'<span class="rg-chip">{n_high} HIGH</span>'
-    f'<span class="rg-chip">{n_gps} with GPS</span></div>', unsafe_allow_html=True)
+# Refresh the header numbers so they include anything saved during this run.
+render_hero()
