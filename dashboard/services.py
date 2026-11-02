@@ -200,3 +200,45 @@ def priority_level(counts):
         if counts[level]:
             return level
     return "NONE"
+
+
+# ------------------------------------------------------- video extras
+def _iou(a, b):
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def estimate_unique_potholes(result, min_iou=0.3, max_gap=2):
+    """Rough estimate: boxes that overlap in nearby analysed frames are treated
+    as the same pothole. This is NOT real tracking, so treat it as approximate."""
+    tracks = []
+    for pos, frame in enumerate(result["frames"]):
+        used = set()
+        for d in sorted(frame["detections"], key=lambda x: -x["confidence"]):
+            best, best_iou = None, min_iou
+            for t_i, t in enumerate(tracks):
+                if t_i in used or pos - t["pos"] > max_gap:
+                    continue
+                v = _iou(d["bbox"], t["box"])
+                if v >= best_iou:
+                    best, best_iou = t_i, v
+            if best is None:
+                tracks.append({"box": d["bbox"], "pos": pos})
+                used.add(len(tracks) - 1)
+            else:
+                tracks[best]["box"], tracks[best]["pos"] = d["bbox"], pos
+                used.add(best)
+    return len(tracks)
+
+
+def video_timeline(result):
+    """Detections per analysed frame, for a chart."""
+    return pd.DataFrame(
+        {
+            "Time (s)": [f["timestamp_seconds"] for f in result["frames"]],
+            "Detections": [len(f["detections"]) for f in result["frames"]],
+        }
+    )

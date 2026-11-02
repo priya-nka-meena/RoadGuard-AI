@@ -11,6 +11,7 @@ from pathlib import Path
 import altair as alt
 import numpy as np
 import pandas as pd
+import pydeck as pdk
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +25,8 @@ db.init_db()
 
 SEV_HEX = {"LOW": "#2ea043", "MEDIUM": "#f09614", "HIGH": "#dc2626"}
 SEV_BG = {"LOW": "#dcfce7", "MEDIUM": "#ffedd5", "HIGH": "#fee2e2"}
+SEV_ORDER = ["LOW", "MEDIUM", "HIGH"]
+SEV_SCALE = alt.Scale(domain=SEV_ORDER, range=[SEV_HEX[s] for s in SEV_ORDER])
 
 st.markdown(
     """
@@ -63,10 +66,10 @@ hero_slot = st.empty()
 
 PAGES = {
     "📊 Overview": ("Overview", "Summary of everything detected and saved so far."),
-    "🔍 Detect": ("Detect", "Upload a road image or video and run the AI detector."),
-    "🗂️ History": ("History", "Every saved detection. Filter, export or delete records."),
-    "🗺️ Map": ("Map", "Detections that have real GPS coordinates."),
-    "🚨 Alerts": ("Alerts", "HIGH-severity hazards that need attention first."),
+    "🔍 Detect": ("Detect", "Upload road images or a video and run the AI detector."),
+    "🗂️ History": ("History", "Every saved detection. Filter, update repair status, export or delete."),
+    "🗺️ Map": ("Map", "Detections with real GPS. Hover or click a dot for details."),
+    "🚨 Alerts": ("Alerts", "HIGH-severity hazards that are not fixed yet."),
 }
 
 with st.sidebar:
@@ -76,7 +79,8 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**Detection settings**")
     conf = st.slider("Confidence threshold", 0.10, 0.90, 0.25, 0.05,
-                     help="Higher = fewer false alarms but may miss faint potholes.")
+                     help="Minimum score a box needs to be shown. Higher = fewer false "
+                          "alarms but may miss faint potholes.")
     sound_on = st.toggle("🔊 Sound alert on HIGH", value=False)
     st.markdown("---")
     st.caption(
@@ -89,6 +93,11 @@ def page_header(key):
     title, desc = PAGES[key]
     st.markdown(f'<div class="rg-title">{title}</div><div class="rg-desc">{desc}</div>',
                 unsafe_allow_html=True)
+
+
+def hex_to_rgb(h):
+    h = h.lstrip("#")
+    return [int(h[i:i + 2], 16) for i in (0, 2, 4)]
 
 
 def beep_wav():
@@ -112,7 +121,7 @@ def severity_cards(counts, total_label="Total detections"):
     c[3].metric("🔴 HIGH", counts["HIGH"])
 
 
-def priority_banner(counts, play_sound):
+def priority_banner(counts):
     level = services.priority_level(counts)
     text = {
         "HIGH": ("🚨", "#b91c1c", "Repair priority: HIGH",
@@ -128,7 +137,11 @@ def priority_banner(counts, play_sound):
         f"{text[0]} {text[2]}<small>{text[3]} (visual estimate)</small></div>",
         unsafe_allow_html=True,
     )
-    if level == "HIGH" and play_sound and sound_on:
+    return level
+
+
+def play_alert(play_sound):
+    if play_sound and sound_on:
         st.audio(beep_wav(), format="audio/wav", autoplay=True)
 
 
@@ -149,64 +162,122 @@ def gps_card(loc):
         st.markdown(
             f'<div class="rg-gps">📍 <b>Image GPS (camera location):</b> '
             f'{loc["latitude"]:.6f}, {loc["longitude"]:.6f}</div>', unsafe_allow_html=True)
+        st.map(pd.DataFrame([loc]), latitude="latitude", longitude="longitude",
+               size=20, zoom=15, height=240)
     else:
         st.markdown(f'<div class="rg-gps">📍 <b>{services.NO_GPS}</b> '
-                    "(this image has no GPS metadata)</div>", unsafe_allow_html=True)
+                    "(no GPS metadata found)</div>", unsafe_allow_html=True)
 
 
 # ------------------------------------------------------------------ Detect
-def show_image_result(res, play_sound):
-    result = res["result"]
+def show_image_result(item):
+    result = item["result"]
     dets = result["detections"]
     rows = services.detections_to_rows(dets)
     counts = services.severity_counts(rows)
     left, right = st.columns(2)
-    left.image(res["original"], caption="Original", channels="BGR", width="stretch")
-    right.image(res["annotated"], caption="Detections (numbers match the table)", width="stretch")
+    left.image(item["original"], caption="Original", channels="BGR", width="stretch")
+    right.image(item["annotated"], caption="Detections (numbers match the table)", width="stretch")
     severity_cards(counts)
-    priority_banner(counts, play_sound)
+    priority_banner(counts)
     if dets:
         styled_table(services.display_table(rows))
     gps_card(result["location"])
     d1, d2, _ = st.columns([1, 1, 3])
-    d1.download_button("⬇️ Annotated image", services.png_bytes(res["annotated"]),
-                       "roadguard_annotated.png", "image/png")
+    d1.download_button("⬇️ Annotated image", services.png_bytes(item["annotated"]),
+                       f"annotated_{Path(item['name']).stem}.png", "image/png",
+                       key=f"dl_img_{item['name']}")
     d2.download_button("⬇️ Results JSON", json.dumps(result, indent=2, default=str),
-                       "roadguard_result.json", "application/json")
+                       f"result_{Path(item['name']).stem}.json", "application/json",
+                       key=f"dl_json_{item['name']}")
+
+
+def show_batch(batch, play_sound):
+    items = batch["items"]
+    ok = [i for i in items if i.get("result")]
+    failed = [i for i in items if i.get("error")]
+    all_rows = [r for i in ok for r in services.detections_to_rows(i["result"]["detections"])]
+    counts = services.severity_counts(all_rows)
+    if len(items) > 1:
+        st.subheader(f"Batch summary: {len(items)} images")
+        severity_cards(counts, "Total potholes")
+        summary = pd.DataFrame([
+            {
+                "Image": i["name"],
+                "Potholes": len(i["result"]["detections"]) if i.get("result") else 0,
+                "Worst severity": (services.priority_level(services.severity_counts(
+                    services.detections_to_rows(i["result"]["detections"]))) if i.get("result") else "-"),
+                "GPS": ("Yes" if i["result"]["location"] else "No") if i.get("result") else "-",
+                "Status": "OK" if i.get("result") else f"Failed: {i['error']}",
+            }
+            for i in items
+        ])
+        st.dataframe(summary, width="stretch", hide_index=True)
+        if all_rows:
+            st.download_button(
+                "⬇️ Batch results CSV",
+                pd.DataFrame([{"image": i["name"], **r} for i in ok
+                              for r in services.detections_to_rows(i["result"]["detections"])])
+                .to_csv(index=False).encode(), "roadguard_batch.csv", "text/csv")
+    for i in failed:
+        st.error(f"{i['name']}: {i['error']}")
+    if counts["HIGH"] > 0 and play_sound:
+        play_alert(True)
+    if ok:
+        names = [i["name"] for i in ok]
+        pick = names[0] if len(names) == 1 else st.selectbox("View image", names)
+        st.markdown("---")
+        show_image_result(next(i for i in ok if i["name"] == pick))
 
 
 def image_tab():
-    file = st.file_uploader("Upload a road image", type=["jpg", "jpeg", "png"], key="img_up")
+    files = st.file_uploader("Upload one or more road images", type=["jpg", "jpeg", "png"],
+                             accept_multiple_files=True, key="img_up")
     play = False
-    if st.button("▶ Run detection", type="primary", key="img_run", disabled=file is None):
-        try:
-            with st.spinner("Detecting potholes..."):
-                data = file.getvalue()
-                result, annotated = services.run_image_analysis(data, file.name, conf)
-            db.save_detections("image", file.name, services.detections_to_rows(result["detections"]))
-            st.session_state["img_result"] = {
-                "result": result, "annotated": annotated, "original": services.decode_image(data),
-            }
-            play = True
-        except Exception as e:  # show the real error instead of hiding it
-            st.error(f"Detection failed: {e}")
-    res = st.session_state.get("img_result")
-    if res:
-        show_image_result(res, play)
+    if st.button("▶ Run detection", type="primary", key="img_run", disabled=not files):
+        items, bar = [], st.progress(0.0, text="Starting...")
+        for n, f in enumerate(files, start=1):
+            bar.progress((n - 1) / len(files), text=f"Analysing {f.name} ({n}/{len(files)})")
+            try:
+                data = f.getvalue()
+                result, annotated = services.run_image_analysis(data, f.name, conf)
+                db.save_detections("image", f.name, services.detections_to_rows(result["detections"]))
+                items.append({"name": f.name, "result": result, "annotated": annotated,
+                              "original": services.decode_image(data)})
+            except Exception as e:  # show the real error instead of hiding it
+                items.append({"name": f.name, "error": str(e)})
+        bar.empty()
+        st.session_state["batch"] = {"items": items}
+        play = True
+    batch = st.session_state.get("batch")
+    if batch:
+        show_batch(batch, play)
 
 
 def show_video_result(res, play_sound):
     result = res["result"]
     rows = services.video_rows(result)
     counts = services.severity_counts(rows)
-    m = st.columns(3)
+    m = st.columns(4)
     m[0].metric("Frames analysed", result["frames_processed"])
     m[1].metric("Video FPS", round(result["fps"], 1))
-    m[2].metric("Detections with GPS", res["gps_matched"])
+    m[2].metric("≈ Unique potholes", services.estimate_unique_potholes(result),
+                help="Rough estimate: overlapping boxes in nearby frames are grouped as one "
+                     "pothole. It is not real tracking, so treat it as approximate.")
+    m[3].metric("Detections with GPS", res["gps_matched"])
     severity_cards(counts, "Sightings (all frames)")
-    st.caption("The same pothole can appear in many frames, so these are sightings, "
-               "not unique potholes.")
-    priority_banner(counts, play_sound)
+    st.caption("Sightings count the same pothole once per frame it appears in.")
+    level = priority_banner(counts)
+    if level == "HIGH":
+        play_alert(play_sound)
+    timeline = services.video_timeline(result)
+    if len(timeline):
+        st.subheader("Detections over time")
+        st.altair_chart(
+            alt.Chart(timeline).mark_area(opacity=.5, line=True, color="#2563eb").encode(
+                x=alt.X("Time (s):Q"), y=alt.Y("Detections:Q"),
+                tooltip=["Time (s)", "Detections"]).properties(height=200),
+            width="stretch")
     if res["previews"]:
         st.subheader("Most confident frames")
         cols = st.columns(len(res["previews"]))
@@ -248,16 +319,23 @@ def video_tab():
 
 
 # -------------------------------------------------------------------- pages
-def history_view(df):
+def history_view(df, keep_id=False):
     out = df.copy()
     out["confidence"] = (out["confidence"] * 100).round(1)
-    out["latitude"] = out["latitude"].apply(lambda v: services.NO_GPS if pd.isna(v) else f"{v:.6f}")
-    out["longitude"] = out["longitude"].apply(lambda v: services.NO_GPS if pd.isna(v) else f"{v:.6f}")
-    return out.rename(columns={
+    for col in ("latitude", "longitude"):
+        out[col] = out[col].apply(lambda v: services.NO_GPS if pd.isna(v) else f"{v:.6f}")
+    out["frame_index"] = out["frame_index"].apply(lambda v: "-" if pd.isna(v) else str(int(v)))
+    out["timestamp_seconds"] = out["timestamp_seconds"].apply(
+        lambda v: "-" if pd.isna(v) else f"{v:.1f}")
+    out = out.rename(columns={
         "created_at": "Time", "source_type": "Type", "source_name": "Source", "label": "Label",
-        "confidence": "Confidence %", "severity": "Severity", "latitude": "Latitude",
-        "longitude": "Longitude", "frame_index": "Frame", "timestamp_seconds": "Video time (s)",
-    }).drop(columns=["id"])
+        "confidence": "Confidence %", "severity": "Severity", "status": "Status",
+        "latitude": "Latitude", "longitude": "Longitude", "frame_index": "Frame",
+        "timestamp_seconds": "Video time (s)",
+    })
+    cols = ["Time", "Type", "Source", "Label", "Confidence %", "Severity", "Status",
+            "Latitude", "Longitude", "Frame", "Video time (s)"]
+    return out[(["id"] if keep_id else []) + cols]
 
 
 def page_overview(df):
@@ -265,41 +343,43 @@ def page_overview(df):
         st.info("No detections yet. Open **Detect** and analyse an image or video.")
         with st.expander("How RoadGuard AI works", expanded=True):
             st.markdown(
-                "1. **Upload** a road image or video.\n"
+                "1. **Upload** road images or a video.\n"
                 "2. **YOLO** finds potholes (label, confidence, bounding box).\n"
                 "3. **Severity** is estimated from the box size (LOW / MEDIUM / HIGH).\n"
                 "4. **GPS** is read from the image when it exists. It is never invented.\n"
-                "5. Results are **saved**, shown on charts and the map, and HIGH ones raise an alert.")
+                "5. Results are **saved**, tracked through repair stages, shown on charts and "
+                "the map, and HIGH ones raise an alert.")
         return
     counts = services.severity_counts(df.to_dict("records"))
-    total = len(df)
+    open_high = int(((df["severity"] == "HIGH") & (df["status"] != "Fixed")).sum())
     k = st.columns(4)
-    k[0].metric("Total detections", total)
-    k[1].metric("🔴 HIGH priority", counts["HIGH"])
+    k[0].metric("Total detections", len(df))
+    k[1].metric("🔴 HIGH, not fixed", open_high)
     k[2].metric("📍 With GPS", int(df["latitude"].notna().sum()))
-    k[3].metric("Avg confidence", f"{df['confidence'].mean() * 100:.0f}%")
-    c1, c2 = st.columns([1, 1.4])
+    k[3].metric("✅ Fixed", int((df["status"] == "Fixed").sum()))
+    c1, c2, c3 = st.columns([1, 1.3, 1.1])
     with c1:
         st.subheader("By severity")
-        donut = pd.DataFrame({"Severity": services.SEVERITIES,
-                              "Count": [counts[s] for s in services.SEVERITIES]})
-        chart = alt.Chart(donut).mark_arc(innerRadius=62).encode(
+        donut = pd.DataFrame({"Severity": SEV_ORDER, "Count": [counts[s] for s in SEV_ORDER]})
+        st.altair_chart(alt.Chart(donut).mark_arc(innerRadius=55).encode(
             theta="Count:Q",
-            color=alt.Color("Severity:N", legend=alt.Legend(orient="bottom"),
-                            scale=alt.Scale(domain=services.SEVERITIES,
-                                            range=[SEV_HEX[s] for s in services.SEVERITIES])),
-            tooltip=["Severity", "Count"]).properties(height=280)
-        st.altair_chart(chart, width="stretch")
+            color=alt.Color("Severity:N", legend=alt.Legend(orient="bottom"), scale=SEV_SCALE),
+            tooltip=["Severity", "Count"]).properties(height=260), width="stretch")
     with c2:
         st.subheader("Activity by day")
         day = df.assign(Day=df["created_at"].str[:10])
-        chart2 = alt.Chart(day).mark_bar(cornerRadiusTopLeft=5, cornerRadiusTopRight=5).encode(
+        st.altair_chart(alt.Chart(day).mark_bar(cornerRadiusTopLeft=5, cornerRadiusTopRight=5).encode(
             x=alt.X("Day:N", title=None), y=alt.Y("count():Q", title="Detections"),
             color=alt.Color("severity:N", title="Severity", legend=alt.Legend(orient="bottom"),
-                            scale=alt.Scale(domain=services.SEVERITIES,
-                                            range=[SEV_HEX[s] for s in services.SEVERITIES])),
-            tooltip=["Day", "severity", "count()"]).properties(height=280)
-        st.altair_chart(chart2, width="stretch")
+                            scale=SEV_SCALE),
+            tooltip=["Day", "severity", "count()"]).properties(height=260), width="stretch")
+    with c3:
+        st.subheader("Repair status")
+        stat = (df["status"].value_counts().reindex(db.STATUSES, fill_value=0)
+                .rename_axis("Status").reset_index(name="Count"))
+        st.altair_chart(alt.Chart(stat).mark_bar(cornerRadiusEnd=5, color="#2563eb").encode(
+            y=alt.Y("Status:N", sort=db.STATUSES, title=None), x=alt.X("Count:Q"),
+            tooltip=["Status", "Count"]).properties(height=260), width="stretch")
     st.subheader("Recent detections")
     styled_table(history_view(df.head(8)))
 
@@ -308,19 +388,37 @@ def page_history(df):
     if df.empty:
         st.info("History is empty.")
     else:
-        f1, f2 = st.columns(2)
-        sev = f1.multiselect("Severity", services.SEVERITIES, default=services.SEVERITIES)
+        f1, f2, f3 = st.columns(3)
+        sev = f1.multiselect("Severity", SEV_ORDER, default=SEV_ORDER)
         typ = f2.multiselect("Source type", ["image", "video"], default=["image", "video"])
-        view = df[df["severity"].isin(sev) & df["source_type"].isin(typ)]
-        st.caption(f"{len(view)} of {len(df)} records")
-        styled_table(history_view(view))
-        st.download_button("⬇️ Download CSV", history_view(view).to_csv(index=False).encode(),
+        sts = f3.multiselect("Repair status", db.STATUSES, default=db.STATUSES)
+        view = df[df["severity"].isin(sev) & df["source_type"].isin(typ) & df["status"].isin(sts)]
+        st.caption(f"{len(view)} of {len(df)} records. Change the **Status** column, then save.")
+        table = history_view(view, keep_id=True)
+        key = "hist_" + "_".join(sev) + "_".join(typ) + "_".join(sts)
+        edited = st.data_editor(
+            table, key=key, hide_index=True, width="stretch",
+            disabled=[c for c in table.columns if c != "Status"],
+            column_config={
+                "id": None,
+                "Status": st.column_config.SelectboxColumn(
+                    "Status", options=db.STATUSES, required=True),
+                "Confidence %": st.column_config.ProgressColumn(
+                    "Confidence", min_value=0, max_value=100, format="%.1f%%"),
+            })
+        changes = [(int(r_id), new) for r_id, old, new in
+                   zip(table["id"], table["Status"], edited["Status"]) if old != new]
+        s1, s2, _ = st.columns([1, 1, 3])
+        if s1.button("💾 Save status changes", type="primary", disabled=not changes):
+            db.update_statuses(changes)
+            st.rerun()
+        s2.download_button("⬇️ Download CSV", history_view(view).to_csv(index=False).encode(),
                            "roadguard_history.csv", "text/csv")
     path, size_kb, rows = db.storage_info()
     with st.expander("💾 Storage and delete options"):
         st.write(f"**Where:** `{path}`  \n**Size:** {size_kb:.1f} KB  \n**Records:** {rows}")
         st.caption("Only detection numbers are stored (time, file name, label, confidence, "
-                   "severity, GPS, video frame). Your images and videos are never saved.")
+                   "severity, status, GPS, video frame). Your images and videos are never saved.")
         if not df.empty:
             src = st.selectbox("Delete records of one source", sorted(df["source_name"].unique()))
             if st.button("Delete this source"):
@@ -338,46 +436,82 @@ def page_map(df):
         st.info("📍 " + services.NO_GPS + ". No saved detection has real GPS yet. "
                 "Upload a phone photo taken with location on, or a video with a GPS CSV.")
         return
-    st.caption(f"{len(gps)} detection(s) with real GPS. Image GPS is the camera location, "
-               "not the exact pothole position.")
-    pts = gps.assign(color=gps["severity"].map(SEV_HEX))
-    st.map(pts, latitude="latitude", longitude="longitude", color="color", size=25, zoom=13)
-    styled_table(history_view(gps))
+    f1, f2 = st.columns(2)
+    sev = f1.multiselect("Severity", SEV_ORDER, default=SEV_ORDER, key="map_sev")
+    sts = f2.multiselect("Repair status", db.STATUSES, default=db.STATUSES, key="map_sts")
+    pts = gps[gps["severity"].isin(sev) & gps["status"].isin(sts)].copy()
+    if pts.empty:
+        st.info("No detections match these filters.")
+        return
+    pts["rgb"] = pts["severity"].map(lambda s: hex_to_rgb(SEV_HEX[s]))
+    pts["conf"] = (pts["confidence"] * 100).round(0).astype(int)
+    st.caption(f"{len(pts)} detection(s) with real GPS. Image GPS is the camera location, "
+               "not the exact pothole position. Click a dot to see its details below.")
+    layer = pdk.Layer(
+        "ScatterplotLayer", id="detections", data=pts,
+        get_position="[longitude, latitude]", get_fill_color="rgb",
+        get_radius=20, radius_min_pixels=8, radius_max_pixels=20,
+        stroked=True, get_line_color=[255, 255, 255], line_width_min_pixels=2, pickable=True)
+    try:
+        view = pdk.data_utils.compute_view(pts[["longitude", "latitude"]])
+        view.zoom = min(view.zoom, 16)
+    except Exception:
+        view = pdk.ViewState(latitude=float(pts["latitude"].mean()),
+                             longitude=float(pts["longitude"].mean()), zoom=13)
+    deck = pdk.Deck(
+        layers=[layer], initial_view_state=view, map_provider="carto", map_style="light",
+        tooltip={"html": "<b>{severity}</b> · {conf}%<br/>{source_name}<br/>Status: {status}<br/>"
+                         "{latitude}, {longitude}",
+                 "style": {"backgroundColor": "#0f172a", "color": "white"}})
+    event = st.pydeck_chart(deck, on_select="rerun", selection_mode="single-object",
+                            key="detections_map")
+    selected = []
+    try:
+        selected = event.selection.objects.get("detections", [])
+    except Exception:
+        pass
+    if selected:
+        s = selected[0]
+        st.markdown(
+            f'<div class="rg-gps">📌 <b>Selected detection</b><br/>'
+            f'Severity: <b style="color:{SEV_HEX.get(s.get("severity"), "#000")}">{s.get("severity")}</b>'
+            f' · Confidence: {s.get("conf")}% · Status: {s.get("status")}<br/>'
+            f'Source: {s.get("source_name")} · Time: {s.get("created_at")}<br/>'
+            f'Location: {float(s.get("latitude")):.6f}, {float(s.get("longitude")):.6f}</div>',
+            unsafe_allow_html=True)
+    styled_table(history_view(pts.drop(columns=["rgb", "conf"])))
 
 
 def page_alerts(df):
-    high = df[df["severity"] == "HIGH"] if not df.empty else df
+    high = df[(df["severity"] == "HIGH") & (df["status"] != "Fixed")] if not df.empty else df
     if high.empty:
-        st.success("No HIGH-severity hazards recorded.")
+        st.success("No unresolved HIGH-severity hazards.")
         return
     st.markdown(
         f'<div class="rg-banner" style="background:{SEV_BG["HIGH"]};color:#b91c1c;border-color:#b91c1c">'
-        f"🚨 {len(high)} HIGH-severity detection(s) recorded"
-        "<small>Prioritise these for inspection and repair.</small></div>", unsafe_allow_html=True)
+        f"🚨 {len(high)} HIGH-severity detection(s) not fixed yet"
+        "<small>Prioritise these for inspection and repair. Update their status on the History page."
+        "</small></div>", unsafe_allow_html=True)
     styled_table(history_view(high))
     if sound_on and st.button("🔊 Test sound alert"):
         st.audio(beep_wav(), format="audio/wav", autoplay=True)
 
 
 history = db.load_history()
+page_header(choice)
 if choice.endswith("Overview"):
-    page_header(choice)
     page_overview(history)
 elif choice.endswith("Detect"):
-    page_header(choice)
-    tab_i, tab_v = st.tabs(["🖼️ Image", "🎞️ Video"])
+    tab_i, tab_v = st.tabs(["🖼️ Images", "🎞️ Video"])
     with tab_i:
         image_tab()
     with tab_v:
         video_tab()
 elif choice.endswith("History"):
-    page_header(choice)
     page_history(history)
 elif choice.endswith("Map"):
-    page_header(choice)
     page_map(history)
 else:
-    page_header(choice)
     page_alerts(history)
 
 # Hero is filled last so its numbers include anything saved during this run.

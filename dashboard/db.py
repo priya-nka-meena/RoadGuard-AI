@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 DB_PATH = Path(__file__).resolve().parents[1] / "outputs" / "roadguard.db"
+STATUSES = ["Reported", "Verified", "In Progress", "Fixed"]
 
 
 def _connect():
@@ -28,9 +29,16 @@ def init_db():
                 latitude REAL,
                 longitude REAL,
                 frame_index INTEGER,
-                timestamp_seconds REAL
+                timestamp_seconds REAL,
+                status TEXT NOT NULL DEFAULT 'Reported'
             )"""
         )
+        # Older databases (from the first dashboard version) have no status column.
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(detections)")]
+        if "status" not in cols:
+            conn.execute(
+                "ALTER TABLE detections ADD COLUMN status TEXT NOT NULL DEFAULT 'Reported'"
+            )
 
 
 def save_detections(source_type, source_name, rows):
@@ -57,10 +65,19 @@ def load_history():
         return pd.read_sql_query("SELECT * FROM detections ORDER BY id DESC", conn)
 
 
+def update_statuses(changes):
+    """changes: list of (detection_id, new_status)."""
+    valid = [(s, int(i)) for i, s in changes if s in STATUSES]
+    if not valid:
+        return 0
+    with _connect() as conn:
+        conn.executemany("UPDATE detections SET status = ? WHERE id = ?", valid)
+    return len(valid)
+
+
 def clear_history():
     with _connect() as conn:
         conn.execute("DELETE FROM detections")
-
 
 
 def delete_source(source_name):
