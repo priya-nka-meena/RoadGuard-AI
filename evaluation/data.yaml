@@ -1,0 +1,7 @@
+path: C:/Users/priya/RoadGuard-AI/evaluation
+train: images
+val: images
+test: images
+
+names:
+  0: pothole

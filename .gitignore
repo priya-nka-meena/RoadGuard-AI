@@ -1,15 +1,31 @@
+# Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
+
+# Virtual environments
 .venv/
 venv/
+
+# Local configuration
 .env
 .vscode/
-.pytest_cache/
-datasets/
-data/
+
+# Model training outputs
 runs/
 outputs/
-*.pt
-*.pth
+
+# Local databases
 *.db
 *.sqlite3
+
+# Raw dataset (large)
+data/potholes_raw/
+
+# Ignore model weights by default
+*.pt
+*.pth
+
+# But include project models
+!models/
+!models/*.pt

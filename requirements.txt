@@ -3,4 +3,6 @@ opencv-python
 streamlit
 pandas
 numpy
+altair
+pydeck
 pytest
